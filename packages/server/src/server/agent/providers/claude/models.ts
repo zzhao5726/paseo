@@ -64,14 +64,21 @@ export async function getClaudeModelsWithSettings(
   discoveredModelIds: ReadonlySet<string> = new Set(),
 ): Promise<AgentModelDefinition[]> {
   const hardcodedModels = getClaudeManifestModels(claudeCodeVersion, discoveredModelIds);
+  const picker = await readClaudeModelPicker(logger, configDir);
   const settingsModels = await readClaudeSettingsModels(logger, configDir);
-  if (settingsModels.length === 0) {
-    return hardcodedModels;
-  }
 
-  const models = [...hardcodedModels];
+  // Mirror Claude Code's own /model picker: modelPicker.replaceBuiltInOptions
+  // hides the built-in Anthropic lineup, so a third-party gateway's curated
+  // options replace it instead of being appended to unavailable first-party IDs.
+  const replaceBuiltIn =
+    picker !== null && picker.replaceBuiltInOptions && picker.options.length > 0;
+  const models = [...(picker !== null && replaceBuiltIn ? picker.options : hardcodedModels)];
+  const additions = [
+    ...(picker !== null && !replaceBuiltIn ? picker.options : []),
+    ...settingsModels,
+  ];
 
-  for (const model of settingsModels) {
+  for (const model of additions) {
     const existingIndex = models.findIndex((candidate) => candidate.id === model.id);
     if (existingIndex !== -1) {
       const existing = models[existingIndex];
@@ -87,6 +94,54 @@ export async function getClaudeModelsWithSettings(
   }
 
   return models;
+}
+
+interface ClaudeModelPicker {
+  options: AgentModelDefinition[];
+  replaceBuiltInOptions: boolean;
+}
+
+async function readClaudeModelPicker(
+  logger: Logger,
+  configDir: string,
+): Promise<ClaudeModelPicker | null> {
+  const settingsPath = path.join(configDir, "settings.json");
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+  } catch (error) {
+    logger.debug({ err: error, settingsPath }, "Failed to read Claude modelPicker");
+    return null;
+  }
+
+  if (!isRecord(parsed) || !isRecord(parsed.modelPicker)) {
+    return null;
+  }
+  const picker = parsed.modelPicker;
+  const rawOptions = Array.isArray(picker.options) ? picker.options : [];
+  const options: AgentModelDefinition[] = [];
+  for (const raw of rawOptions) {
+    if (!isRecord(raw) || typeof raw.model !== "string") {
+      continue;
+    }
+    const id = raw.model.trim();
+    if (id.length === 0 || options.some((model) => model.id === id)) {
+      continue;
+    }
+    options.push({
+      provider: "claude",
+      id,
+      label: typeof raw.label === "string" && raw.label.trim().length > 0 ? raw.label : id,
+      description: typeof raw.description === "string" ? raw.description : undefined,
+      thinkingOptions: getClaudeCustomModelThinkingOptions(),
+    });
+  }
+
+  if (options.length === 0) {
+    return null;
+  }
+  return { options, replaceBuiltInOptions: picker.replaceBuiltInOptions === true };
 }
 
 async function readClaudeSettingsModels(
